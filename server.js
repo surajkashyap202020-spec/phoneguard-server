@@ -1,115 +1,160 @@
 const express = require('express');
-const cors = require('cors');
-const multer = require('multer');
+const cors    = require('cors');
+const multer  = require('multer');
 const { v4: uuid } = require('uuid');
-const http = require('http');
-const path = require('path');
-const fs = require('fs');
+const path    = require('path');
+const fs      = require('fs');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3000;
 
+// ── Storage paths ─────────────────────────────────────────
+const DATA_DIR    = path.join(__dirname, 'data');
+const UPLOAD_DIR  = path.join(__dirname, 'uploads');
+[DATA_DIR, UPLOAD_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
+
+// ── Middleware ────────────────────────────────────────────
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
+app.use('/uploads', express.static(UPLOAD_DIR));
 
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-app.use('/uploads', express.static(uploadDir));
-
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => cb(null, `${Date.now()}_${uuid()}.jpg`)
+const upload = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+        filename:    (req, file, cb) => cb(null, `${Date.now()}_${uuid()}.jpg`)
+    }),
+    limits: { fileSize: 10 * 1024 * 1024 }
 });
-const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 
-// In-memory database
-const db = { devices: {}, locations: {}, alerts: {}, photos: {}, commands: {} };
-
-function ensure(token) {
-    if (!db.locations[token]) db.locations[token] = [];
-    if (!db.alerts[token])    db.alerts[token]    = [];
-    if (!db.photos[token])    db.photos[token]    = [];
-    if (!db.commands[token])  db.commands[token]  = [];
+// ── File-based storage helpers ────────────────────────────
+function readJson(file) {
+    try {
+        const f = path.join(DATA_DIR, file);
+        if (!fs.existsSync(f)) return {};
+        return JSON.parse(fs.readFileSync(f, 'utf8'));
+    } catch(e) { return {}; }
 }
 
-// ── Health check — works at both /health and /api/health ──
+function writeJson(file, data) {
+    try { fs.writeFileSync(path.join(DATA_DIR, file), JSON.stringify(data), 'utf8'); }
+    catch(e) { console.error('Write error:', e.message); }
+}
+
+function readArr(file) {
+    try {
+        const f = path.join(DATA_DIR, file);
+        if (!fs.existsSync(f)) return [];
+        return JSON.parse(fs.readFileSync(f, 'utf8'));
+    } catch(e) { return []; }
+}
+
+function writeArr(file, data) {
+    try { fs.writeFileSync(path.join(DATA_DIR, file), JSON.stringify(data), 'utf8'); }
+    catch(e) {}
+}
+
+// ── Routes ────────────────────────────────────────────────
+// Health — both with and without /api prefix
 app.get(['/health', '/api/health'], (req, res) => {
-    res.json({ status: 'running', version: '1.0.0', devices: Object.keys(db.devices).length, uptime: process.uptime() });
+    const devices = readJson('devices.json');
+    res.json({ status: 'running', version: '2.0', devices: Object.keys(devices).length, uptime: process.uptime() });
 });
 
-// ── Root ──
 app.get(['/', '/api'], (req, res) => {
-    res.json({ name: 'PhoneGuard Server', version: '1.0.0', devices: Object.keys(db.devices).length, status: 'running' });
+    const devices = readJson('devices.json');
+    res.json({ name: 'PhoneGuard Server', version: '2.0', devices: Object.keys(devices).length, status: 'running' });
 });
 
-// ── Register ──
+// Register
 app.post(['/register', '/api/register'], (req, res) => {
     const { token, nickname, imei, model, platform } = req.body;
     if (!token) return res.status(400).json({ error: 'Token required' });
-    ensure(token);
-    db.devices[token] = {
-        token, nickname: nickname || 'My Phone', imei: imei || 'unknown',
-        model: model || 'Android', platform: platform || 'android',
-        registeredAt: db.devices[token]?.registeredAt || new Date().toISOString(),
-        lastSeen: new Date().toISOString(), battery: 100, status: 'registered',
-        pingCount: db.devices[token]?.pingCount || 0,
-        photoCount: db.devices[token]?.photoCount || 0,
-        alertCount: db.devices[token]?.alertCount || 0,
-        lastLat: 0, lastLng: 0,
+    const devices = readJson('devices.json');
+    devices[token] = {
+        token, nickname: nickname || 'My Phone',
+        imei: imei || 'unknown', model: model || 'Android', platform: platform || 'android',
+        registeredAt: devices[token]?.registeredAt || new Date().toISOString(),
+        lastSeen: new Date().toISOString(), battery: devices[token]?.battery || 100,
+        status: 'registered',
+        pingCount:  devices[token]?.pingCount  || 0,
+        photoCount: devices[token]?.photoCount || 0,
+        alertCount: devices[token]?.alertCount || 0,
+        lastLat: devices[token]?.lastLat || 0,
+        lastLng: devices[token]?.lastLng || 0,
     };
+    writeJson('devices.json', devices);
     res.json({ success: true, token });
 });
 
-// ── Location ping ──
+// Ping — location update
 app.post(['/ping', '/api/ping'], (req, res) => {
     const { token, lat, lng, accuracy, battery, speed, source, ts } = req.body;
     if (!token) return res.status(400).json({ error: 'Token required' });
-    ensure(token);
+
     const ping = {
-        id: uuid(), lat: parseFloat(lat) || 0, lng: parseFloat(lng) || 0,
-        accuracy: parseFloat(accuracy) || 0, battery: parseInt(battery) || 0,
-        speed: parseFloat(speed) || 0, source: source || 'gps',
-        ts: ts || Date.now(), receivedAt: new Date().toISOString()
+        id: uuid(),
+        lat:      parseFloat(lat)      || 0,
+        lng:      parseFloat(lng)      || 0,
+        accuracy: parseFloat(accuracy) || 0,
+        battery:  parseInt(battery)    || 0,
+        speed:    parseFloat(speed)    || 0,
+        source:   source || 'gps',
+        ts:       ts || Date.now(),
+        receivedAt: new Date().toISOString()
     };
-    db.locations[token].unshift(ping);
-    if (db.locations[token].length > 1000) db.locations[token].pop();
-    if (!db.devices[token]) {
-        db.devices[token] = { token, nickname: 'My Phone', imei: 'unknown', model: 'Android', platform: 'android', registeredAt: new Date().toISOString(), pingCount: 0, photoCount: 0, alertCount: 0 };
+
+    // Save location
+    const locFile = `loc_${token}.json`;
+    const locs = readArr(locFile);
+    locs.unshift(ping);
+    if (locs.length > 1000) locs.length = 1000;
+    writeArr(locFile, locs);
+
+    // Update device
+    const devices = readJson('devices.json');
+    if (!devices[token]) {
+        devices[token] = { token, nickname: 'My Phone', imei: 'unknown', model: 'Android', platform: 'android', registeredAt: new Date().toISOString(), pingCount: 0, photoCount: 0, alertCount: 0 };
     }
-    db.devices[token].lastSeen  = new Date().toISOString();
-    db.devices[token].battery   = ping.battery;
-    db.devices[token].lastLat   = ping.lat;
-    db.devices[token].lastLng   = ping.lng;
-    db.devices[token].status    = 'tracking';
-    db.devices[token].pingCount = (db.devices[token].pingCount || 0) + 1;
-    res.json({ success: true, pingCount: db.devices[token].pingCount });
+    devices[token].lastSeen  = new Date().toISOString();
+    devices[token].battery   = ping.battery;
+    devices[token].lastLat   = ping.lat;
+    devices[token].lastLng   = ping.lng;
+    devices[token].status    = 'tracking';
+    devices[token].pingCount = (devices[token].pingCount || 0) + 1;
+    writeJson('devices.json', devices);
+
+    res.json({ success: true, pingCount: devices[token].pingCount });
 });
 
-// ── Alert ──
+// Alert
 app.post(['/alert', '/api/alert'], (req, res) => {
     const { token, type, new_sim, new_number, lat, lng, ts } = req.body;
     if (!token) return res.status(400).json({ error: 'Token required' });
-    ensure(token);
     const alert = {
-        id: uuid(), type: type || 'unknown', new_sim: new_sim || '',
-        new_number: new_number || '', lat: parseFloat(lat) || 0,
-        lng: parseFloat(lng) || 0, ts: ts || Date.now(), receivedAt: new Date().toISOString()
+        id: uuid(), type: type || 'unknown',
+        new_sim: new_sim || '', new_number: new_number || '',
+        lat: parseFloat(lat) || 0, lng: parseFloat(lng) || 0,
+        ts: ts || Date.now(), receivedAt: new Date().toISOString()
     };
-    db.alerts[token].unshift(alert);
-    if (db.alerts[token].length > 200) db.alerts[token].pop();
-    if (db.devices[token]) {
-        db.devices[token].alertCount = (db.devices[token].alertCount || 0) + 1;
-        db.devices[token].lastSeen = new Date().toISOString();
+    const alertFile = `alerts_${token}.json`;
+    const alerts = readArr(alertFile);
+    alerts.unshift(alert);
+    if (alerts.length > 200) alerts.length = 200;
+    writeArr(alertFile, alerts);
+
+    const devices = readJson('devices.json');
+    if (devices[token]) {
+        devices[token].alertCount = (devices[token].alertCount || 0) + 1;
+        devices[token].lastSeen = new Date().toISOString();
+        writeJson('devices.json', devices);
     }
     res.json({ success: true });
 });
 
-// ── Photo ──
+// Photo upload
 app.post(['/photo', '/api/photo'], upload.single('photo'), (req, res) => {
     const { token, trigger, lat, lng } = req.body;
     if (!token) return res.status(400).json({ error: 'Token required' });
-    ensure(token);
     const record = {
         id: uuid(), trigger: trigger || 'unknown',
         lat: parseFloat(lat) || 0, lng: parseFloat(lng) || 0,
@@ -117,54 +162,74 @@ app.post(['/photo', '/api/photo'], upload.single('photo'), (req, res) => {
         filename: req.file?.filename || null,
         url: req.file ? `/uploads/${req.file.filename}` : null
     };
-    db.photos[token].unshift(record);
-    if (db.photos[token].length > 100) db.photos[token].pop();
-    if (db.devices[token]) db.devices[token].photoCount = (db.devices[token].photoCount || 0) + 1;
+    const photoFile = `photos_${token}.json`;
+    const photos = readArr(photoFile);
+    photos.unshift(record);
+    if (photos.length > 100) photos.length = 100;
+    writeArr(photoFile, photos);
+
+    const devices = readJson('devices.json');
+    if (devices[token]) {
+        devices[token].photoCount = (devices[token].photoCount || 0) + 1;
+        writeJson('devices.json', devices);
+    }
     res.json({ success: true, photo: record });
 });
 
-// ── Commands ──
+// Commands
 app.get(['/commands', '/api/commands'], (req, res) => {
     const token = req.query.token;
     if (!token) return res.json([]);
-    ensure(token);
-    const pending = db.commands[token] || [];
-    db.commands[token] = [];
-    if (db.devices[token]) db.devices[token].lastSeen = new Date().toISOString();
-    res.json(pending);
+    const cmdFile = `cmds_${token}.json`;
+    const cmds = readArr(cmdFile);
+    writeArr(cmdFile, []); // clear after reading
+    const devices = readJson('devices.json');
+    if (devices[token]) { devices[token].lastSeen = new Date().toISOString(); writeJson('devices.json', devices); }
+    res.json(cmds);
 });
 
 app.post(['/command', '/api/command'], (req, res) => {
     const { token, command } = req.body;
     if (!token || !command) return res.status(400).json({ error: 'Token and command required' });
-    ensure(token);
     const cmd = { id: uuid(), command: command.toLowerCase(), sentAt: new Date().toISOString(), status: 'pending' };
-    db.commands[token].push(cmd);
+    const cmdFile = `cmds_${token}.json`;
+    const cmds = readArr(cmdFile);
+    cmds.push(cmd);
+    writeArr(cmdFile, cmds);
     res.json({ success: true, command: cmd });
 });
 
 app.post(['/ack', '/api/ack'], (req, res) => res.json({ success: true }));
 
-// ── Device data ──
-app.get(['/devices', '/api/devices'], (req, res) => res.json(Object.values(db.devices)));
+// Device data
+app.get(['/devices', '/api/devices'], (req, res) => {
+    res.json(Object.values(readJson('devices.json')));
+});
 
 app.get(['/device/:token', '/api/device/:token'], (req, res) => {
     const { token } = req.params;
-    if (!db.devices[token]) return res.status(404).json({ error: 'Not found' });
+    const devices = readJson('devices.json');
+    if (!devices[token]) return res.status(404).json({ error: 'Not found' });
+    const locs = readArr(`loc_${token}.json`);
     res.json({
-        device: db.devices[token],
-        lastLocation: db.locations[token]?.[0] || null,
-        alertCount: db.alerts[token]?.length || 0,
-        photoCount: db.photos[token]?.length || 0,
+        device: devices[token],
+        lastLocation: locs[0] || null,
+        alertCount: readArr(`alerts_${token}.json`).length,
+        photoCount: readArr(`photos_${token}.json`).length,
     });
 });
 
 app.get(['/locations/:token', '/api/locations/:token'], (req, res) => {
     const limit = parseInt(req.query.limit) || 100;
-    res.json((db.locations[req.params.token] || []).slice(0, limit));
+    res.json(readArr(`loc_${req.params.token}.json`).slice(0, limit));
 });
 
-app.get(['/alerts/:token', '/api/alerts/:token'], (req, res) => res.json(db.alerts[req.params.token] || []));
-app.get(['/photos/:token', '/api/photos/:token'], (req, res) => res.json(db.photos[req.params.token] || []));
+app.get(['/alerts/:token', '/api/alerts/:token'], (req, res) => {
+    res.json(readArr(`alerts_${req.params.token}.json`));
+});
 
-app.listen(PORT, () => console.log(`PhoneGuard Server running on port ${PORT}`));
+app.get(['/photos/:token', '/api/photos/:token'], (req, res) => {
+    res.json(readArr(`photos_${req.params.token}.json`));
+});
+
+app.listen(PORT, () => console.log(`PhoneGuard Server v2.0 running on port ${PORT}`));
